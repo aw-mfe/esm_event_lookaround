@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+
+from configparser import SafeConfigParser
+from datetime import datetime  
+from datetime import timedelta  
+import argparse
+import base64
+import inspect
+import json
+import logging
+import logging.config
+import os
+import re
+import socket
+import sys
+import time
+import requests
+import urllib.parse as urlparse
+requests.packages.urllib3.disable_warnings()
+
+
+__author__ = "Andy Walden"
+__version__ = "0.01"
+
+
+class Args(object):
+
+    def __init__(self, args):
+        self.log_levels = ["quiet", "error", "warning", "info", "debug"]
+        self.formatter_class = argparse.RawDescriptionHelpFormatter
+        self.parser = argparse.ArgumentParser(
+                formatter_class=self.formatter_class,
+                description="Query for inactive McAfee ESM data sources"
+            )
+        self.args = args
+
+        self.parser.add_argument("-t", "--timestamp",
+                                 dest="stime", metavar='', required=True,
+                                 help="Set time to check for events. \
+                                        Format: '01/01/2017 00:10:00'")
+
+        self.parser.add_argument("-i", "--ip",
+                                 dest="q_ip", metavar='', required=True,
+                                 help="Set the IP address to use for query.")
+
+        self.parser.add_argument("-w", "--window",
+                                 dest="window", metavar='', default=600, type=int,
+                                 help="Time range that will be searched before and \
+                                 after provided timestamp. Default: 600 (10 minutes)")
+                                 
+                                        
+        self.parser.add_argument("-v", "--version",
+                                 action="version",
+                                 help="Show version",
+                                 version="%(prog)s {}".format(__version__))
+
+        self.parser.add_argument("-l", "--level",
+                                 default=None, dest="level",
+                                 choices=self.log_levels, metavar='',
+                                 help="Logging output level. Default: warning")
+        
+        self.parser.add_argument("-c", "--config",
+                                 default=None, dest="cfgfile", metavar='',
+                                 help="Path to config file. Default: config.ini")                                 
+
+        self.pargs = self.parser.parse_args()
+
+    def get_args(self):
+        return self.pargs
+
+
+class Config(object):
+    """ Creates object for provided configfile/section settings """
+    def __init__(self, filename, header):
+        config = SafeConfigParser()
+        cfgfile = config.read(filename)
+        if not cfgfile:
+            raise ValueError('Config file not found:', filename)
+        self.__dict__.update(config.items(header))
+
+def logging_init():
+    filename = get_filename()
+    logfile = filename + ".log"
+    hostname = socket.gethostname()
+    formatter = logging.Formatter('%(asctime)s {} %(module)s: %(message)s'.format(hostname), 
+                                    datefmt='%b %d %H:%M:%S')
+    logger = logging.getLogger()
+    fh = logging.FileHandler(logfile, mode='w')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+def get_filename():
+    filename = (inspect.getfile(inspect.currentframe()).split("\\", -1)[-1]).rsplit(".", 1)[0]
+    return filename
+
+def search_kv(key, val, thing):
+    """ Searches for a given a key, value in the given container which can be nested. When 
+        there is a match the dictionary in which the matching key/value is returned. 
+    """
+    if isinstance (thing, dict):
+        for k, v in thing.items():
+            if k == key and v == val:
+                yield thing
+            elif isinstance(v, dict):
+                for result in search_kv(key, val, v):
+                    yield result
+            elif isinstance(v, list):
+                for d in v:
+                    for result in search_kv(key, val, d):
+                        yield result
+        
+        
+class NitroESM(object):
+    
+    def __init__(self, esmhost, user, passwd):
+        """ Init instance attributes """
+        self.esmhost = esmhost
+        self.user = user
+        self.passwd = passwd
+        self.url = 'https://{}/ess'.format(self.esmhost)
+        self.login_headers = {'content-type': 'application/x-www-form-urlencoded'}
+
+    def login(self):
+        """ Authenticate to ESM and establish session """
+        self.params = { 'SID' : '0' }
+        self.api_call('ESSMGT_GETESSBUILDSTAMP', self.params)
+        self.buildstamp = self.result['BUILD']
+        self.b = re.compile('(\d\.\d\.\d) (\d{8}\d{6})(MR\d+)')
+        self.version = re.search(self.b, self.buildstamp).group(1)
+        self.build = re.search(self.b, self.buildstamp).group(2)
+        self.patch = re.search(self.b, self.buildstamp).group(3)
+        self.params = {
+          'SID' : '0',
+          'USERNAME' : self.user,
+          'PWD' : self.passwd,
+          'LOCALE' : 'eng',
+          'OS' : 'WIN',
+          'VER' : self.version+' '+self.build[:-6],
+          'PATCH' : self.patch
+        }
+        self.api_call('USER_LOGIN', self.params)
+        self.sid = self.result['SID']
+        
+    def api_call(self, api, params):
+        self.raw_params = "%14".join([k+"%13"+v+"%13" for (k,v) in params.items()])
+        self.request = "Request=API%13" + api + "%13%14" + self.raw_params +"%14"
+        self.req = requests.post(self.url, 
+                                  headers=self.login_headers, 
+                                  data=self.request, 
+                                  verify=False)
+        self.request_output = self.req.text
+            
+        self.data = re.search('Response=(.*)', self.request_output).group(1)
+        self.data = self.data.replace('%14', ' ')
+        self.pairs = self.data.split()
+    
+        self.result = {}
+        for self.pair in self.pairs:
+            self.pair = self.pair.replace('%13', ' ')
+            self.pair = self.pair.split()
+        
+            self.key = self.pair[0]
+
+            if self.key == 'ITEMS':
+                self.value = self.pair[-1]
+            else:
+                self.value = urlparse.unquote(self.pair[-1])
+            self.result[self.key] = self.value
+
+
+            
+    def dns_query(self, source_ip, stime, etime):
+        self.source_ip = source_ip
+        self.stime = stime
+        self.etime = etime
+        self.params = {'SID' : self.sid}
+        self.params['QID'] = '6'
+        self.params['FILTER'] = ("Alert.SrcIP[" + self.source_ip + "]" \
+          "#Select[Alert.ID,Alert.LastTime,Rule.msg,Alert.3,Alert.4]" \
+          "#Limit[1000,0]" \
+          "#Alert.IPSID[144115188075855872/8]" \
+          "#Alert.NormID[1087373312/12]" \
+          "#Alert.LastTime[" + self.stime + ",DV," + self.etime + ",DV]" \
+          "#SortBy[2,?DESC]") 
+        self.params['BKGRND'] = "T"
+        self.params['REVERSE'] = "F"
+        self.params['GETTOTAL'] = "F"
+
+        self.api_call('QRY_EXECUTEQUERY', self.params)
+        self.rid = self.result['RID']
+        self.params = {
+          'SID' : self.sid,
+          'RID' : self.rid
+        }
+        self.api_call('QRY_GETQUERYSTATUS', self.params)
+        
+        while self.result['QF'] != 'T':
+           time.sleep(2)
+           self.api_call('QRY_GETQUERYSTATUS', self.params)
+
+       
+    def get_results(self):
+        self.params = {
+          'SID' : self.sid,
+          'RID' : self.rid,
+          'SP'  : "1",
+          'NR'  : "100",
+          'REVERSE' : "F"
+        }
+        self.api_call('QRY_GETQUERYRESULT', self.params)
+        self.items = self.result['ITEMS']
+        self.items = self.items.split('%11%12')
+        self.formatted_results = []
+        for self.item in self.items:
+            self.item = self.item.replace('%20', ' ')
+            self.item = self.item.replace('%3A%3A', '')
+            self.item = self.item.replace('%3A', ':')
+            self.item = self.item.replace('%2F', '/')
+            self.item = self.item.split('%11')
+            self.formatted_results.append(self.item)
+        return self.formatted_results
+    
+def calc_time_lookaround(looktime, timestamp):
+    ''' Returns start and ending timestamps 
+        for the given time delta (in seconds) and timestamp.
+        Timestamp is validated to be in format: 'MM/DD/YYYY HH:MM:SS' 
+    '''
+    format = '%m/%d/%Y %H:%M:%S'
+    try:
+        timestamp_o = datetime.strptime(timestamp, format)
+        start_time_o = timestamp_o - timedelta(seconds=looktime)
+        start_time = start_time_o.strftime(format)
+        end_time_o = timestamp_o + timedelta(seconds=looktime)
+        end_time = end_time_o.strftime(format)
+        return start_time, end_time
+    except ValueError:
+        raise ValueError("Incorrect data format, should be '01/05/2017 02:00:05' - with quotes.")
+
+        
+def main():
+    """ Main function """
+    
+    args = Args(sys.argv)
+    pargs = args.get_args()
+    logging_init()
+    
+    print(pargs.window, type(pargs.window))
+    if pargs.level:
+        logging.getLogger().setLevel(getattr(logging, pargs.level.upper()))
+    
+    configfile = pargs.cfgfile if pargs.cfgfile else 'config.ini'
+    try:
+        config = Config(configfile, "esm")
+        try:
+            host = config.esmhost
+            user = config.esmuser
+            passwd = config.esmpass
+        except AttributeError as e:
+            logging.error("Required settings not found in configfile: %s", configfile)
+            sys.exit()
+    except ValueError:
+        logging.error("Config file not found: %s", configfile)
+        sys.exit(1)
+        
+    start_time, end_time = calc_time_lookaround(pargs.window, pargs.stime)
+    esm = NitroESM(host, user, passwd)
+    esm.login()
+    esm.dns_query(pargs.q_ip, start_time, end_time)
+    dns_events = esm.get_results()
+    for line in dns_events:
+        print(*line, sep=', ')
+    
+    
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logging.warning("Control-C Pressed, stopping...")
+        sys.exit()
