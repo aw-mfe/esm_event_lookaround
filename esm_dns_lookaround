@@ -247,7 +247,6 @@ def main():
     pargs = args.get_args()
     logging_init()
     
-    print(pargs.window, type(pargs.window))
     if pargs.level:
         logging.getLogger().setLevel(getattr(logging, pargs.level.upper()))
     
