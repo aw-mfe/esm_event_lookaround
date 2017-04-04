@@ -142,7 +142,11 @@ class NitroESM(object):
           'PATCH' : self.patch
         }
         self.api_call('USER_LOGIN', self.params)
-        self.sid = self.result['SID']
+        try:
+            self.sid = self.result['SID']
+        except KeyError:
+            print("Invalid credentials: {} {}".format(self.user, self.passwd))
+            sys.exit(0)
         
     def api_call(self, api, params):
         self.raw_params = "%14".join([k+"%13"+v+"%13" for (k,v) in params.items()])
@@ -269,9 +273,11 @@ def main():
     esm.login()
     esm.dns_query(pargs.q_ip, start_time, end_time)
     dns_events = esm.get_results()
-    for line in dns_events:
-        print(*line, sep=', ')
-    
+    if len(dns_events) > 1:
+        for line in dns_events:
+            print(*line, sep=', ')
+    else:
+        print("No events found.")
     
 if __name__ == "__main__":
     try:
