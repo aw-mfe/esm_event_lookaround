@@ -128,25 +128,28 @@ class NitroESM(object):
         self.params = { 'SID' : '0' }
         self.api_call('ESSMGT_GETESSBUILDSTAMP', self.params)
         self.buildstamp = self.result['BUILD']
-        self.b = re.compile('(\d\.\d\.\d) (\d{8}\d{6})(MR\d+)')
-        self.version = re.search(self.b, self.buildstamp).group(1)
-        self.build = re.search(self.b, self.buildstamp).group(2)
-        self.patch = re.search(self.b, self.buildstamp).group(3)
+        print(self.buildstamp)
+        self.b = re.compile('(\d\.\d\.\d) (\d{8})')
+        print(self.b)
+        try:        
+            self.version = re.search(self.b, self.buildstamp).group(1)
+            self.build = re.search(self.b, self.buildstamp).group(2)
+            #self.patch = re.search(self.b, self.buildstamp).group(3)
+            print(self.version, self.build)
+        except AttributeError: 
+            pass
         self.params = {
           'SID' : '0',
           'USERNAME' : self.user,
           'PWD' : self.passwd,
           'LOCALE' : 'eng',
           'OS' : 'WIN',
-          'VER' : self.version+' '+self.build[:-6],
-          'PATCH' : self.patch
+          'VER' : self.version+' '+self.build,
+          'PATCH' : ''
+          #'PATCH' : self.patch
         }
         self.api_call('USER_LOGIN', self.params)
-        try:
-            self.sid = self.result['SID']
-        except KeyError:
-            print("Invalid credentials: {} {}".format(self.user, self.passwd))
-            sys.exit(0)
+        self.sid = self.result['SID']
         
     def api_call(self, api, params):
         self.raw_params = "%14".join([k+"%13"+v+"%13" for (k,v) in params.items()])
@@ -273,11 +276,9 @@ def main():
     esm.login()
     esm.dns_query(pargs.q_ip, start_time, end_time)
     dns_events = esm.get_results()
-    if len(dns_events) > 1:
-        for line in dns_events:
-            print(*line, sep=', ')
-    else:
-        print("No events found.")
+    for line in dns_events:
+        print(*line, sep=', ')
+    
     
 if __name__ == "__main__":
     try:
