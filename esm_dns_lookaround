@@ -20,7 +20,7 @@ requests.packages.urllib3.disable_warnings()
 
 
 __author__ = "Andy Walden"
-__version__ = "0.01"
+__version__ = "0.05"
 
 
 class Args(object):
@@ -120,42 +120,72 @@ class NitroESM(object):
         self.esmhost = esmhost
         self.user = user
         self.passwd = passwd
-        self.url = 'https://{}/ess'.format(self.esmhost)
-        self.login_headers = {'content-type': 'application/x-www-form-urlencoded'}
+        self._build_login_urls()
+        self._encode_login()
+        self._build_params()
+ 
+    def _build_login_urls(self):
+        """ Concatenate URLs """
+        self.url = 'https://{}/rs/esm/'.format(self.esmhost)
+        self.int_url = 'https://{}/ess'.format(self.esmhost)
+        self.login_url = '{}{}'.format(self.url, 'login')
 
-    def login(self):
-        """ Authenticate to ESM and establish session """
-        self.params = { 'SID' : '0' }
-        self.api_call('ESSMGT_GETESSBUILDSTAMP', self.params)
-        self.buildstamp = self.result['BUILD']
-        print(self.buildstamp)
-        self.b = re.compile('(\d\.\d\.\d) (\d{8})')
-        print(self.b)
-        try:        
-            self.version = re.search(self.b, self.buildstamp).group(1)
-            self.build = re.search(self.b, self.buildstamp).group(2)
-            #self.patch = re.search(self.b, self.buildstamp).group(3)
-            print(self.version, self.build)
-        except AttributeError: 
-            pass
-        self.params = {
-          'SID' : '0',
-          'USERNAME' : self.user,
-          'PWD' : self.passwd,
-          'LOCALE' : 'eng',
-          'OS' : 'WIN',
-          'VER' : self.version+' '+self.build,
-          'PATCH' : ''
-          #'PATCH' : self.patch
-        }
-        self.api_call('USER_LOGIN', self.params)
-        self.sid = self.result['SID']
+    def _encode_login(self):
+        self.b64_user = base64.b64encode(self.user.encode('utf-8')).decode()
+        self.b64_passwd = base64.b64encode(self.passwd.encode('utf-8')).decode()
+    
+    def _build_params(self):
+            self.params = {"username": self.b64_user, 
+                           "password": self.b64_passwd, 
+                           "locale": "en_US", 
+                           "os" : "Win32"}
+            try:
+                self.params_json = json.dumps(self.params)
+            except TypeError as e:
+                logging.error("Invalid parameters: %s", self.params)
+                sys.exit(1)
         
+    def login(self):
+        try:
+            self.v10_login_headers = {'Content-Type': 'application/json'}
+            self.login_response = requests.post(self.login_url, 
+                                                 self.params_json, 
+                                                 headers=self.v10_login_headers, 
+                                                 verify=False)
+            self.cookie = self.login_response.headers.get('Set-Cookie')
+            try:
+                self.jwttoken = re.search('(^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*)', 
+                                           self.cookie).group(1)
+            except TypeError as e:
+                logging.error("Failed login: %s: %s", self.user, self.passwd)
+                sys.exit(1)
+            self.xsrf_token = self.login_response.headers.get('Xsrf-Token')
+            self.session_headers = {'Cookie' : self.jwttoken, 
+                                    'X-Xsrf-Token' : self.xsrf_token, 
+                                    'Content-Type': 'application/json'}
+        except KeyError:
+            logging.error("Failed login: %s: %s", self.user, self.passwd)
+            sys.exit(1)
+
+    def cmdquery(self, cmd, query=None):
+        """ Send query to ESM, return JSON result """
+        self.cmd = cmd
+        self.query = query
+        self.url = 'https://{}/rs/esm/'.format(self.esmhost)
+        self.result = requests.post(self.url + self.cmd,
+                                    headers=self.session_headers,
+                                    data=self.query, verify=False)
+        try: 
+            return self.result.json()
+        except:
+            logging.error("Error - ESM replied with: %s", self.result.text)
+            sys.exit(1)
+            
     def api_call(self, api, params):
         self.raw_params = "%14".join([k+"%13"+v+"%13" for (k,v) in params.items()])
         self.request = "Request=API%13" + api + "%13%14" + self.raw_params +"%14"
-        self.req = requests.post(self.url, 
-                                  headers=self.login_headers, 
+        self.req = requests.post(self.int_url, 
+                                  headers=self.session_headers, 
                                   data=self.request, 
                                   verify=False)
         self.request_output = self.req.text
@@ -176,14 +206,13 @@ class NitroESM(object):
             else:
                 self.value = urlparse.unquote(self.pair[-1])
             self.result[self.key] = self.value
-
+        return(self.result)
 
             
     def dns_query(self, source_ip, stime, etime):
         self.source_ip = source_ip
         self.stime = stime
         self.etime = etime
-        self.params = {'SID' : self.sid}
         self.params['QID'] = '6'
         self.params['FILTER'] = ("Alert.SrcIP[" + self.source_ip + "]" \
           "#Select[Alert.ID,Alert.LastTime,Rule.msg,Alert.3,Alert.4]" \
@@ -199,7 +228,6 @@ class NitroESM(object):
         self.api_call('QRY_EXECUTEQUERY', self.params)
         self.rid = self.result['RID']
         self.params = {
-          'SID' : self.sid,
           'RID' : self.rid
         }
         self.api_call('QRY_GETQUERYSTATUS', self.params)
@@ -211,7 +239,6 @@ class NitroESM(object):
        
     def get_results(self):
         self.params = {
-          'SID' : self.sid,
           'RID' : self.rid,
           'SP'  : "1",
           'NR'  : "100",
