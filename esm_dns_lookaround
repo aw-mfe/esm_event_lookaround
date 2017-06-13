@@ -35,7 +35,7 @@ class Args(object):
         self.args = args
 
         self.parser.add_argument("-t", "--timestamp",
-                                 dest="stime", metavar='', required=True,
+                                 dest="stime", nargs = '+' , required=True,
                                  help="Set time to check for events. \
                                         Format: '01/01/2017 00:10:00'")
 
@@ -279,6 +279,7 @@ def main():
     
     args = Args(sys.argv)
     pargs = args.get_args()
+    pargs.stime = ''.join(pargs.stime)
     logging_init()
     
     if pargs.level:
